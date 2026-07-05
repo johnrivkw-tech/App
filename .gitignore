@@ -1,0 +1,9 @@
+source/
+*.apk
+*.zip
+*.deb
+*.rpm
+*.AppImage
+*.msi
+*.exe
+*.dmg

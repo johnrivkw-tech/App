@@ -1,0 +1,137 @@
+name: Build App from App-main
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "App version (empty = from libs.versions.toml)"
+        required: false
+        default: ""
+      build_number:
+        description: "Android versionCode (empty = max(toml build, 15+run#))"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      build_num: ${{ steps.version.outputs.build_num }}
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN || github.token }}
+          path: source
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          TOML_VERSION=$(grep '^app-version' source/gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          TOML_BUILD=$(grep '^app-buildNumber' source/gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          OFFSET=15
+          CI_BUILD=$((OFFSET + GITHUB_RUN_NUMBER))
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION_NAME="${{ inputs.version }}"
+            [[ -z "$VERSION_NAME" ]] && VERSION_NAME="$TOML_VERSION"
+            BUILD_INPUT="${{ inputs.build_number }}"
+            if [[ -n "$BUILD_INPUT" ]]; then
+              BUILD_NUMBER="$BUILD_INPUT"
+            else
+              BUILD_NUMBER=$(( TOML_BUILD > CI_BUILD ? TOML_BUILD : CI_BUILD ))
+            fi
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION_NAME="${GITHUB_REF#refs/tags/v}"
+            BUILD_NUMBER="$CI_BUILD"
+          else
+            VERSION_NAME="$TOML_VERSION"
+            BUILD_NUMBER="$CI_BUILD"
+          fi
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_num=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN || github.token }}
+          path: source
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode Keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p source/signing
+          echo "$KEYSTORE_B64" | base64 --decode > source/signing/android.jks
+          echo "storePassword=$KEY_PASS" > source/key.properties
+          echo "keyPassword=$KEY_PASS" >> source/key.properties
+          echo "keyAlias=release" >> source/key.properties
+          echo "storeFile=../signing/android.jks" >> source/key.properties
+
+      - name: Build Android Release APK
+        env:
+          CRASH_REPORTER_URL: ${{ secrets.CRASH_REPORTER_URL }}
+          CRASH_REPORTER_APP_NAME: ${{ secrets.CRASH_REPORTER_APP_NAME }}
+          CRASH_REPORTER_API_KEY: ${{ secrets.CRASH_REPORTER_API_KEY }}
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          chmod +x source/gradlew
+          cd source
+          ./gradlew :composeApp:assemblePhoneRelease --no-daemon -x :composeApp:lintVitalPhoneRelease \
+            -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
+            -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}" \
+            -PcrashReporterUrl="$CRASH_REPORTER_URL" \
+            -PcrashReporterAppName="$CRASH_REPORTER_APP_NAME" \
+            -PcrashReporterApiKey="$CRASH_REPORTER_API_KEY"
+
+      - name: Collect APKs
+        run: |
+          mkdir -p release
+          for apk in source/composeApp/build/outputs/apk/phone/release/*.apk; do
+            base=$(basename "$apk")
+            new_name="Anisurge-${base#anisurge-}"
+            cp "$apk" "release/$new_name"
+          done
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || needs.resolve-version.outputs.version_name }}
+          name: Anisurge ${{ needs.resolve-version.outputs.version_name }} (${{ needs.resolve-version.outputs.build_num }})
+          body: |
+            Built from [Anisurge/App-main](https://github.com/Anisurge/App-main) @ ${{ github.sha }}
+
+            Version ${{ needs.resolve-version.outputs.version_name }} (build ${{ needs.resolve-version.outputs.build_num }})
+          files: release/*
+          generate_release_notes: false
+          draft: false
+          prerelease: true
