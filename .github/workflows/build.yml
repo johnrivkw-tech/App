@@ -107,7 +107,7 @@ jobs:
           echo "storePassword=$KEY_PASS" > source/key.properties
           echo "keyPassword=$KEY_PASS" >> source/key.properties
           echo "keyAlias=release" >> source/key.properties
-          echo "storeFile=../signing/android.jks" >> source/key.properties
+          echo "storeFile=signing/android.jks" >> source/key.properties
 
       - name: Decode google-services.json
         env:
