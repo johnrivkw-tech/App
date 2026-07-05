@@ -36,14 +36,13 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Resolve version and build number
         id: version
         run: |
           set -euo pipefail
-          TOML_VERSION=$(grep '^app-version' source/gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
-          TOML_BUILD=$(grep '^app-buildNumber' source/gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          TOML_VERSION=$(grep '^app-version' gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          TOML_BUILD=$(grep '^app-buildNumber' gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
           OFFSET=15
           CI_BUILD=$((OFFSET + GITHUB_RUN_NUMBER))
 
@@ -69,9 +68,6 @@ jobs:
 
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "build_num=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "## Build **${VERSION_NAME}+${BUILD_NUMBER}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Source: \`gradle/libs.versions.toml\` → $TOML_VERSION+$TOML_BUILD" >> "$GITHUB_STEP_SUMMARY"
-          echo "- CI build number: $CI_BUILD" >> "$GITHUB_STEP_SUMMARY"
 
   build-android:
     needs: resolve-version
@@ -82,7 +78,6 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -99,15 +94,15 @@ jobs:
           KEY_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
           if [ -z "$KEYSTORE_B64" ]; then
-            echo "No ANDROID_KEYSTORE_BASE64 secret set — skipping unsigned build"
-            exit 0
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret not set — cannot sign APK"
+            exit 1
           fi
-          mkdir -p source/signing
-          echo "$KEYSTORE_B64" | base64 --decode > source/signing/android.jks
-          echo "storePassword=$KEY_PASS" > source/key.properties
-          echo "keyPassword=$KEY_PASS" >> source/key.properties
-          echo "keyAlias=release" >> source/key.properties
-          echo "storeFile=signing/android.jks" >> source/key.properties
+          mkdir -p signing
+          echo "$KEYSTORE_B64" | base64 --decode > signing/android.jks
+          echo "storePassword=$KEY_PASS" > key.properties
+          echo "keyPassword=$KEY_PASS" >> key.properties
+          echo "keyAlias=release" >> key.properties
+          echo "storeFile=../signing/android.jks" >> key.properties
 
       - name: Decode google-services.json
         env:
@@ -133,7 +128,7 @@ jobs:
                   json.loads(candidate)
               except Exception:
                   continue
-              Path("source/composeApp/google-services.json").write_text(candidate)
+              Path("composeApp/google-services.json").write_text(candidate)
               break
           else:
               raise SystemExit("GOOGLE_SERVICES_JSON_BASE64 is neither valid base64 JSON nor raw JSON")
@@ -148,8 +143,7 @@ jobs:
           DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
           DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
         run: |
-          chmod +x source/gradlew
-          cd source
+          chmod +x gradlew
           ./gradlew :composeApp:assemblePhoneRelease --no-daemon -x :composeApp:lintVitalPhoneRelease \
             -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
             -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}" \
@@ -160,7 +154,7 @@ jobs:
       - name: Collect Android APKs
         run: |
           mkdir -p dist
-          for apk in source/composeApp/build/outputs/apk/phone/release/*.apk; do
+          for apk in composeApp/build/outputs/apk/phone/release/*.apk; do
             base=$(basename "$apk")
             new_name="Anisurge-${base#anisurge-}"
             cp "$apk" "dist/$new_name"
@@ -185,7 +179,6 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -211,8 +204,7 @@ jobs:
           DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
           DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
         run: |
-          chmod +x source/gradlew
-          cd source
+          chmod +x gradlew
           ./gradlew :composeApp:packageDeb :composeApp:packageRpm :composeApp:buildLinuxAppImage :composeApp:createPortableZip --no-daemon \
             -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
             -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
@@ -221,10 +213,10 @@ jobs:
         run: |
           mkdir -p dist
           ARCH="amd64"
-          DEB_FILE=$(find source/composeApp/build/compose/binaries/main/deb/ -name '*.deb' | head -n 1 || true)
-          RPM_FILE=$(find source/composeApp/build/compose/binaries/main/rpm/ -name '*.rpm' | head -n 1 || true)
-          APPIMAGE_FILE=$(find source/composeApp/build/compose/binaries/main/appimage/ -name '*.AppImage' | head -n 1 || true)
-          ZIP_FILE=$(find source/composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+          DEB_FILE=$(find composeApp/build/compose/binaries/main/deb/ -name '*.deb' | head -n 1 || true)
+          RPM_FILE=$(find composeApp/build/compose/binaries/main/rpm/ -name '*.rpm' | head -n 1 || true)
+          APPIMAGE_FILE=$(find composeApp/build/compose/binaries/main/appimage/ -name '*.AppImage' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
 
           [[ -n "$DEB_FILE" ]] && cp "$DEB_FILE" "dist/Anisurge-linux-${ARCH}.deb"
           [[ -n "$RPM_FILE" ]] && cp "$RPM_FILE" "dist/Anisurge-linux-${ARCH}.rpm"
@@ -250,7 +242,6 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -266,8 +257,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $sourceDir = "source"
-          $nativeDir = Join-Path $sourceDir "composeApp\src\desktopMain\resources\native"
+          $nativeDir = "composeApp\src\desktopMain\resources\native"
           New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
           $headers = @{ "User-Agent" = "Mozilla/5.0"; "Authorization" = "Bearer $env:GH_TOKEN" }
           $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/zhongfly/mpv-winbuild/releases?per_page=20" -Headers $headers
@@ -293,8 +283,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $sourceDir = "source"
-          $nativeDir = Join-Path $sourceDir "composeApp\src\desktopMain\resources\native"
+          $nativeDir = "composeApp\src\desktopMain\resources\native"
           New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
           $headers = @{ "User-Agent" = "Mozilla/5.0"; "Authorization" = "Bearer $env:GH_TOKEN" }
           Write-Host "Downloading FFmpeg static build..."
@@ -315,7 +304,6 @@ jobs:
           DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
           DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
         run: |
-          cd source
           $gradleCommon = @(
             "--no-daemon",
             "--no-parallel",
@@ -329,7 +317,7 @@ jobs:
       - name: Validate Windows MSI (smoke test)
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path "source/composeApp/build/compose/binaries/main/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $msi = Get-ChildItem -Path "composeApp\build\compose\binaries\main\msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $msi) { throw "No MSI produced" }
           $target = Join-Path $env:RUNNER_TEMP "anisurge-msi-smoke"
           if (Test-Path $target) { Remove-Item $target -Recurse -Force }
@@ -347,9 +335,9 @@ jobs:
         run: |
           mkdir -p dist
           ARCH="x86_64"
-          MSI_FILE=$(find source/composeApp/build/compose/binaries/main/msi/ -name '*.msi' | head -n 1 || true)
-          EXE_FILE=$(find source/composeApp/build/compose/binaries/main/exe/ -name '*.exe' | head -n 1 || true)
-          ZIP_FILE=$(find source/composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+          MSI_FILE=$(find composeApp/build/compose/binaries/main/msi/ -name '*.msi' | head -n 1 || true)
+          EXE_FILE=$(find composeApp/build/compose/binaries/main/exe/ -name '*.exe' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
 
           [[ -n "$MSI_FILE" ]] && cp "$MSI_FILE" "dist/Anisurge-win-${ARCH}.msi"
           [[ -n "$EXE_FILE" ]] && cp "$EXE_FILE" "dist/Anisurge-win-${ARCH}-setup.exe"
@@ -374,7 +362,6 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -389,7 +376,7 @@ jobs:
         run: brew install mpv
 
       - name: Generate macOS app icon (.icns)
-        run: bash source/scripts/generate-macos-icon.sh
+        run: bash scripts/generate-macos-icon.sh
 
       - name: Build macOS DMG and portable zip
         env:
@@ -397,8 +384,7 @@ jobs:
           DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
           DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
         run: |
-          chmod +x source/gradlew
-          cd source
+          chmod +x gradlew
           ./gradlew :composeApp:packageDistributionForCurrentOS :composeApp:createPortableZip --no-daemon \
             -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
             -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
@@ -407,11 +393,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          DMG_FILE=$(find source/composeApp/build/compose/binaries/main/dmg/ -name '*.dmg' | head -n 1 || true)
-          ZIP_FILE=$(find source/composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+          DMG_FILE=$(find composeApp/build/compose/binaries/main/dmg/ -name '*.dmg' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
 
           if [[ -z "$DMG_FILE" ]]; then
-            echo "::error::No .dmg produced — check packageDistributionForCurrentOS logs"
+            echo "::error::No .dmg produced"
             exit 1
           fi
           cp "$DMG_FILE" "dist/Anisurge-macos.dmg"
@@ -438,7 +424,6 @@ jobs:
         with:
           repository: Anisurge/App-main
           token: ${{ secrets.APP_MAIN_TOKEN }}
-          path: source
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -455,8 +440,7 @@ jobs:
           DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
           DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
         run: |
-          chmod +x source/gradlew
-          cd source
+          chmod +x gradlew
           ./gradlew :composeApp:linkPodReleaseFrameworkIosArm64 :composeApp:linkPodReleaseFrameworkIosSimulatorArm64 --no-daemon \
             -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
             -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
@@ -464,13 +448,13 @@ jobs:
       - name: Build iOS App (Unsigned IPA)
         run: |
           mkdir -p dist
-          cd source/iosApp
+          cd iosApp
           xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath ../../build/ios.xcarchive \
+            -archivePath ../build/ios.xcarchive \
             archive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
-          cd ../..
+          cd ..
           mkdir -p Payload
           cp -R build/ios.xcarchive/Products/Applications/iosApp.app Payload/
           VER="${{ needs.resolve-version.outputs.version_name }}"
