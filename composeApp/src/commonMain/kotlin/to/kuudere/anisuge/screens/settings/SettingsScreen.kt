@@ -1098,7 +1098,7 @@ private fun PreferencesTab(
                 Slider(
                     value = uiState.settings.syncPercentage.toFloat(),
                     onValueChange = { onSyncPercentageChange(it.toInt()) },
-                    valueRange = 50f..100f,
+                    valueRange = 1f..100f,
                     steps = 49,
                     colors = SliderDefaults.colors(
                         thumbColor = Color.White,
