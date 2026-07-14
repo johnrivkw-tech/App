@@ -362,7 +362,7 @@ class SettingsViewModel(
                         settingsStore.setAutoSkipIntro(s.skipIntro)
                         settingsStore.setAutoSkipOutro(s.skipOutro)
                         settingsStore.setDefaultLang(s.defaultLang)
-                        settingsStore.setSyncPercentage(s.syncPercentage.toInt().coerceIn(50, 100))
+                        settingsStore.setSyncPercentage(s.syncPercentage.toInt().coerceIn(1, 100))
                     }
                 } else {
                     _uiState.update {
@@ -402,7 +402,7 @@ class SettingsViewModel(
                     settingsStore.setAutoSkipIntro(s.skipIntro)
                     settingsStore.setAutoSkipOutro(s.skipOutro)
                     settingsStore.setDefaultLang(s.defaultLang)
-                    settingsStore.setSyncPercentage(s.syncPercentage.toInt().coerceIn(50, 100))
+                    settingsStore.setSyncPercentage(s.syncPercentage.toInt().coerceIn(1, 100))
                 }
             } else {
                 _uiState.update {
@@ -430,7 +430,7 @@ class SettingsViewModel(
     fun setAutoPlay(enabled: Boolean) = updateSetting { it.copy(autoPlay = enabled) }
     fun setSkipIntro(enabled: Boolean) = updateSetting { it.copy(skipIntro = enabled) }
     fun setSkipOutro(enabled: Boolean) = updateSetting { it.copy(skipOutro = enabled) }
-    fun setSyncPercentage(percentage: Int) = updateSetting { it.copy(syncPercentage = percentage.coerceIn(50, 100).toDouble()) }
+    fun setSyncPercentage(percentage: Int) = updateSetting { it.copy(syncPercentage = percentage.coerceIn(1, 100).toDouble()) }
 
     fun setDownloadPath(path: String) {
         viewModelScope.launch { settingsStore.setDownloadPath(path) }
