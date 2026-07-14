@@ -1,0 +1,519 @@
+name: Build and Release from App-main
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "App version (empty = app-version from gradle/libs.versions.toml)"
+        required: false
+        default: ""
+      build_number:
+        description: "Android versionCode / build suffix (empty = max(toml build, 15+run#))"
+        required: false
+        default: ""
+      create_release:
+        description: "Upload artifacts to a GitHub Release (tag pushes always release)"
+        type: boolean
+        default: false
+      build_ios:
+        description: "Build unsigned iOS IPA"
+        type: boolean
+        default: false
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      build_num: ${{ steps.version.outputs.build_num }}
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Resolve version and build number
+        id: version
+        run: |
+          set -euo pipefail
+          TOML_VERSION=$(grep '^app-version' gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          TOML_BUILD=$(grep '^app-buildNumber' gradle/libs.versions.toml | sed 's/.*= *"\(.*\)"/\1/')
+          OFFSET=15
+          CI_BUILD=$((OFFSET + GITHUB_RUN_NUMBER))
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION_NAME="${{ inputs.version }}"
+            [[ -z "$VERSION_NAME" ]] && VERSION_NAME="$TOML_VERSION"
+            BUILD_INPUT="${{ inputs.build_number }}"
+            if [[ -n "$BUILD_INPUT" ]]; then
+              BUILD_NUMBER="$BUILD_INPUT"
+            else
+              BUILD_NUMBER=$(( TOML_BUILD > CI_BUILD ? TOML_BUILD : CI_BUILD ))
+            fi
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION_NAME="${GITHUB_REF#refs/tags/v}"
+            BUILD_NUMBER="$CI_BUILD"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION_NAME="${GITHUB_REF#refs/tags/}"
+            BUILD_NUMBER="$CI_BUILD"
+          else
+            VERSION_NAME="$TOML_VERSION"
+            BUILD_NUMBER="$CI_BUILD"
+          fi
+
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_num=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret not set — cannot sign APK"
+            exit 1
+          fi
+          mkdir -p signing
+          echo "$KEYSTORE_B64" | base64 --decode > signing/android.jks
+          echo "storePassword=$KEY_PASS" > key.properties
+          echo "keyPassword=$KEY_PASS" >> key.properties
+          echo "keyAlias=release" >> key.properties
+          echo "storeFile=../signing/android.jks" >> key.properties
+
+      - name: Decode google-services.json
+        env:
+          GOOGLE_SERVICES_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_SECRET" ]; then
+            echo "No GOOGLE_SERVICES_JSON_BASE64 secret set — skipping"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          secret = os.environ["GOOGLE_SERVICES_SECRET"].strip()
+          candidates = []
+          try:
+              decoded = base64.b64decode("".join(secret.split()), validate=True).decode("utf-8")
+              candidates.append(decoded)
+          except Exception:
+              pass
+          candidates.append(secret)
+          for candidate in candidates:
+              try:
+                  json.loads(candidate)
+              except Exception:
+                  continue
+              Path("composeApp/google-services.json").write_text(candidate)
+              break
+          else:
+              raise SystemExit("GOOGLE_SERVICES_JSON_BASE64 is neither valid base64 JSON nor raw JSON")
+          PY
+
+      - name: Build Android APK
+        env:
+          CRASH_REPORTER_URL: ${{ secrets.CRASH_REPORTER_URL }}
+          CRASH_REPORTER_APP_NAME: ${{ secrets.CRASH_REPORTER_APP_NAME }}
+          CRASH_REPORTER_API_KEY: ${{ secrets.CRASH_REPORTER_API_KEY }}
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:assemblePhoneRelease --no-daemon -x :composeApp:lintVitalPhoneRelease \
+            -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
+            -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}" \
+            -PcrashReporterUrl="$CRASH_REPORTER_URL" \
+            -PcrashReporterAppName="$CRASH_REPORTER_APP_NAME" \
+            -PcrashReporterApiKey="$CRASH_REPORTER_API_KEY"
+
+      - name: Collect Android APKs
+        run: |
+          mkdir -p dist
+          for apk in composeApp/build/outputs/apk/phone/release/*.apk; do
+            base=$(basename "$apk")
+            new_name="Anisurge-${base#anisurge-}"
+            cp "$apk" "dist/$new_name"
+          done
+          ls -lh dist/
+
+      - name: Upload Android APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-linux:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev rpm desktop-file-utils fakeroot p7zip-full libfuse2
+          mkdir -p "$HOME/bin"
+          curl -sLo "$HOME/bin/appimagetool" "https://github.com/AppImage/appimagetool/releases/latest/download/appimagetool-x86_64.AppImage"
+          chmod +x "$HOME/bin/appimagetool"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build Linux Distributions
+        env:
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:packageDeb :composeApp:packageRpm :composeApp:buildLinuxAppImage :composeApp:createPortableZip --no-daemon \
+            -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
+            -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
+
+      - name: Collect Linux Artifacts
+        run: |
+          mkdir -p dist
+          ARCH="amd64"
+          DEB_FILE=$(find composeApp/build/compose/binaries/main/deb/ -name '*.deb' | head -n 1 || true)
+          RPM_FILE=$(find composeApp/build/compose/binaries/main/rpm/ -name '*.rpm' | head -n 1 || true)
+          APPIMAGE_FILE=$(find composeApp/build/compose/binaries/main/appimage/ -name '*.AppImage' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+
+          [[ -n "$DEB_FILE" ]] && cp "$DEB_FILE" "dist/Anisurge-linux-${ARCH}.deb"
+          [[ -n "$RPM_FILE" ]] && cp "$RPM_FILE" "dist/Anisurge-linux-${ARCH}.rpm"
+          [[ -n "$APPIMAGE_FILE" ]] && cp "$APPIMAGE_FILE" "dist/Anisurge-linux-${ARCH}.AppImage"
+          [[ -n "$ZIP_FILE" ]] && cp "$ZIP_FILE" "dist/Anisurge-linux-${ARCH}-portable.zip"
+          ls -lh dist/
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-distributions
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-windows:
+    needs: resolve-version
+    runs-on: windows-latest
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download and Bundle MPV Library
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $nativeDir = "composeApp\src\desktopMain\resources\native"
+          New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
+          $headers = @{ "User-Agent" = "Mozilla/5.0"; "Authorization" = "Bearer $env:GH_TOKEN" }
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/zhongfly/mpv-winbuild/releases?per_page=20" -Headers $headers
+          $asset = $releases | ForEach-Object { $_.assets } | Where-Object { $_.name -like "mpv-dev-x86_64-v3-*.7z" -or $_.name -like "mpv-dev-x86_64-*.7z" } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find an mpv-dev x86_64 release asset" }
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "mpv-dev.7z" -Headers $headers
+          7z x mpv-dev.7z -ompv-extracted
+          $dlls = Get-ChildItem -Path "mpv-extracted" -Recurse -Filter "*.dll"
+          if (-not $dlls) { throw "No DLLs were found in the extracted MPV archive" }
+          foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName (Join-Path $nativeDir $dll.Name) -Force
+          }
+          $libMpv = Join-Path $nativeDir "libmpv-2.dll"
+          $mpv2 = Join-Path $nativeDir "mpv-2.dll"
+          if ((Test-Path $libMpv) -and -not (Test-Path $mpv2)) {
+            Copy-Item $libMpv $mpv2 -Force
+          }
+          if (-not (Test-Path $mpv2)) { throw "mpv-2.dll was not found after bundling MPV dependencies" }
+          Write-Host "Bundled MPV DLLs:"; Get-ChildItem $nativeDir -Filter "*.dll" | ForEach-Object { $_.Name }
+
+      - name: Download and Bundle FFmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $nativeDir = "composeApp\src\desktopMain\resources\native"
+          New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
+          $headers = @{ "User-Agent" = "Mozilla/5.0"; "Authorization" = "Bearer $env:GH_TOKEN" }
+          Write-Host "Downloading FFmpeg static build..."
+          $ffRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" -Headers $headers
+          $ffAsset = $ffRelease.assets | Where-Object { $_.name -like "*win64-gpl*" -and $_.name -like "*.zip" } | Select-Object -First 1
+          if (-not $ffAsset) { throw "Could not find a win64-gpl FFmpeg release asset" }
+          Invoke-WebRequest -Uri $ffAsset.browser_download_url -OutFile "ffmpeg.zip" -Headers $headers
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg-extracted" -Force
+          $ffmpegExe = Get-ChildItem -Path "ffmpeg-extracted" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          if (-not $ffmpegExe) { throw "ffmpeg.exe not found in extracted archive" }
+          Copy-Item $ffmpegExe.FullName (Join-Path $nativeDir "ffmpeg.exe") -Force
+          Write-Host "FFmpeg bundled: $((Get-Item (Join-Path $nativeDir "ffmpeg.exe")).Length / 1MB) MB"
+
+      - name: Build Windows Distributions
+        shell: pwsh
+        env:
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          $gradleCommon = @(
+            "--no-daemon",
+            "--no-parallel",
+            "-PappVersion=${{ needs.resolve-version.outputs.version_name }}",
+            "-PappBuildNumber=${{ needs.resolve-version.outputs.build_num }}"
+          )
+          ./gradlew @gradleCommon :composeApp:packageMsi
+          ./gradlew @gradleCommon :composeApp:packageExe
+          ./gradlew @gradleCommon :composeApp:createPortableZip
+
+      - name: Validate Windows MSI (smoke test)
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path "composeApp\build\compose\binaries\main\msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) { throw "No MSI produced" }
+          $target = Join-Path $env:RUNNER_TEMP "anisurge-msi-smoke"
+          if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          $args = @("/a", "`"$($msi.FullName)`"", "TARGETDIR=`"$target`"", "/qn", "/l*v", "`"$env:RUNNER_TEMP\anisurge-msi-smoke.log`"")
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\anisurge-msi-smoke.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+            throw "MSI administrative install failed with exit code $($proc.ExitCode)"
+          }
+          Write-Host "MSI smoke test OK"
+
+      - name: Collect Windows Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          ARCH="x86_64"
+          MSI_FILE=$(find composeApp/build/compose/binaries/main/msi/ -name '*.msi' | head -n 1 || true)
+          EXE_FILE=$(find composeApp/build/compose/binaries/main/exe/ -name '*.exe' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+
+          [[ -n "$MSI_FILE" ]] && cp "$MSI_FILE" "dist/Anisurge-win-${ARCH}.msi"
+          [[ -n "$EXE_FILE" ]] && cp "$EXE_FILE" "dist/Anisurge-win-${ARCH}-setup.exe"
+          [[ -n "$ZIP_FILE" ]] && cp "$ZIP_FILE" "dist/Anisurge-win-${ARCH}-portable.zip"
+          ls -lh dist/
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-distributions
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-macos:
+    needs: resolve-version
+    runs-on: macos-latest
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install MPV (playback on desktop)
+        run: brew install mpv
+
+      - name: Generate macOS app icon (.icns)
+        run: bash scripts/generate-macos-icon.sh
+
+      - name: Build macOS DMG and portable zip
+        env:
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:packageDistributionForCurrentOS :composeApp:createPortableZip --no-daemon \
+            -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
+            -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
+
+      - name: Collect macOS Artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          DMG_FILE=$(find composeApp/build/compose/binaries/main/dmg/ -name '*.dmg' | head -n 1 || true)
+          ZIP_FILE=$(find composeApp/build/distributions/ -name '*.zip' | head -n 1 || true)
+
+          if [[ -z "$DMG_FILE" ]]; then
+            echo "::error::No .dmg produced"
+            exit 1
+          fi
+          cp "$DMG_FILE" "dist/Anisurge-macos.dmg"
+          [[ -n "$ZIP_FILE" ]] && cp "$ZIP_FILE" "dist/Anisurge-macos-portable.zip"
+          ls -lh dist/
+
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-distributions
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  build-ios:
+    needs: resolve-version
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ios }}
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout App-main source
+        uses: actions/checkout@v4
+        with:
+          repository: Anisurge/App-main
+          token: ${{ secrets.APP_MAIN_TOKEN }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build iOS Framework
+        env:
+          DISCORD_CLIENT_ID: ${{ vars.DISCORD_CLIENT_ID }}
+          DISCORD_LARGE_IMAGE_KEY: ${{ vars.DISCORD_LARGE_IMAGE_KEY }}
+          DISCORD_SMALL_IMAGE_KEY: ${{ vars.DISCORD_SMALL_IMAGE_KEY }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :composeApp:linkPodReleaseFrameworkIosArm64 :composeApp:linkPodReleaseFrameworkIosSimulatorArm64 --no-daemon \
+            -PappVersion="${{ needs.resolve-version.outputs.version_name }}" \
+            -PappBuildNumber="${{ needs.resolve-version.outputs.build_num }}"
+
+      - name: Build iOS App (Unsigned IPA)
+        run: |
+          mkdir -p dist
+          cd iosApp
+          xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath ../build/ios.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          cd ..
+          mkdir -p Payload
+          cp -R build/ios.xcarchive/Products/Applications/iosApp.app Payload/
+          VER="${{ needs.resolve-version.outputs.version_name }}"
+          BUILD="${{ needs.resolve-version.outputs.build_num }}"
+          zip -r "dist/Anisurge-${VER}.${BUILD}-ios-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh dist/
+
+      - name: Upload iOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-distributions
+          path: dist/
+          if-no-files-found: warn
+
+  create-release:
+    needs:
+      - resolve-version
+      - build-android
+      - build-linux
+      - build-windows
+      - build-macos
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( \
+            -name '*.apk' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o \
+            -name '*.zip' -o -name '*.msi' -o -name '*-setup.exe' -o -name '*.dmg' -o -name '*.ipa' \
+          \) -exec cp {} release/ \;
+          echo "Release bundle:"
+          ls -lh release/
+          if [[ -z "$(ls -A release 2>/dev/null)" ]]; then
+            echo "::error::No release artifacts found"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || needs.resolve-version.outputs.version_name }}
+          name: Anisurge ${{ needs.resolve-version.outputs.version_name }} (${{ needs.resolve-version.outputs.build_num }})
+          body: |
+            Built from [Anisurge/App-main](https://github.com/Anisurge/App-main) @ ${{ github.sha }}
+
+            Version ${{ needs.resolve-version.outputs.version_name }} (build ${{ needs.resolve-version.outputs.build_num }})
+          files: |
+            release/*
+          generate_release_notes: false
+          draft: false
+          prerelease: true
